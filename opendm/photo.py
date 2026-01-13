@@ -7,6 +7,7 @@ import exifread
 import numpy as np
 from six import string_types
 from datetime import datetime, timedelta, timezone
+from pygeomag import GeoMag
 
 from opendm import log
 from opendm.rollingshutter import get_rolling_shutter_readout
@@ -458,7 +459,7 @@ class ODM_Photo:
                             self.camera_projection = camera_projection
 
                     # OPK
-                    self.set_attr_from_xmp_tag('yaw', xtags, ['@drone-dji:FlightYawDegree', '@Camera:Yaw', 'Camera:Yaw'], float)
+                    self.set_attr_from_xmp_tag('yaw', xtags, ['@drone-dji:GimbalYawDegree', '@drone-dji:FlightYawDegree', '@Camera:Yaw', 'Camera:Yaw'], float)
                     self.set_attr_from_xmp_tag('pitch', xtags, ['@drone-dji:GimbalPitchDegree', '@Camera:Pitch', 'Camera:Pitch'], float)
                     self.set_attr_from_xmp_tag('roll', xtags, ['@drone-dji:GimbalRollDegree', '@Camera:Roll', 'Camera:Roll'], float)
 
@@ -892,56 +893,123 @@ class ODM_Photo:
     
     def compute_opk(self):
         if self.has_ypr() and self.has_geo():
-            y, p, r = math.radians(self.yaw), math.radians(self.pitch), math.radians(self.roll)
+            """
+                Compute OPK angles from DJI gimbal YPR angles.
+                
+                Output OPK is compatible with OpenSfM's rotation_from_opk function.
+                
+                Parameters:
+                    lat: Latitude in degrees
+                    lon: Longitude in degrees  
+                    alt: Altitude in meters
+                    yaw: Gimbal yaw in degrees (heading, 0=North, 90=East)
+                    pitch: Gimbal pitch in degrees (0=nadir, 90=horizon)
+                    roll: Gimbal roll in degrees (typically 0 or 180 for backward-facing)
+                
+                Returns:
+                    omega, phi, kappa: OPK angles in degrees
+            """
+            geo_mag = GeoMag()
+            yr = self.get_decimal_year()
 
-            # Ref: New Calibration and Computing Method for Direct 
-            # Georeferencing of Image and Scanner Data Using the 
-            # Position and Angular Data of an Hybrid Inertial Navigation System 
-            # by Manfred Bäumker
+            result = geo_mag.calculate(glat=self.latitude, glon=self.longitude, alt=self.altitude/1000.0, time=yr)
+            declination = result.d  # degrees
+            self.yaw -= declination
 
-            # YPR rotation matrix
-            cnb = np.array([[ math.cos(y) * math.cos(p), math.cos(y) * math.sin(p) * math.sin(r) - math.sin(y) * math.cos(r), math.cos(y) * math.sin(p) * math.cos(r) + math.sin(y) * math.sin(r)],
-                            [ math.sin(y) * math.cos(p), math.sin(y) * math.sin(p) * math.sin(r) + math.cos(y) * math.cos(r), math.sin(y) * math.sin(p) * math.cos(r) - math.cos(y) * math.sin(r)],
-                            [ -math.sin(p), math.cos(p) * math.sin(r), math.cos(p) * math.cos(r)],
-                           ])
-
-            # Convert between image and body coordinates
-            # Top of image pixels point to flying direction
-            # and camera is looking down.
-            # We might need to change this if we want different
-            # camera mount orientations (e.g. backward or sideways)
-
-            # (Swap X/Y, flip Z)
-            cbb = np.array([[0, 1, 0],
-                            [1, 0, 0],
-                            [0, 0, -1]])
+            lat_r = math.radians(self.latitude)
+            lon_r = math.radians(self.longitude)
+            y = math.radians(self.yaw)
+            p = math.radians(self.pitch)
+            r = math.radians(self.roll)
             
+            cy, sy = math.cos(y), math.sin(y)
+            cp, sp = math.cos(p), math.sin(p)
+            cr, sr = math.cos(r), math.sin(r)
+            
+            # Navigation frame (NED) to body rotation (yaw and pitch, no roll)
+            cnb = np.array([
+                [cy * cp, -sy, cy * sp],
+                [sy * cp,  cy, sy * sp],
+                [-sp,       0,  cp]
+            ])
+            
+            # Camera to body transformation (with roll)
+            # Accounts for DJI gimbal inner axis rotation
+            cbb = np.array([
+                [sr,  cr, 0],
+                [cr, -sr, 0],
+                [0,   0, -1]
+            ])
+            
+            # R_cam_to_nav (camera to NED)
+            R_cam_to_ned = cnb @ cbb
+            
+            # Build orthonormal NED to ECEF transformation
             delta = 1e-7
+            p1 = np.array(ecef_from_lla(self.latitude + delta, self.longitude, self.altitude))
+            p2 = np.array(ecef_from_lla(self.latitude - delta, self.longitude, self.altitude))
+            north = p1 - p2
+            north /= np.linalg.norm(north)
             
-            alt = self.altitude if self.altitude is not None else 0.0
-            p1 = np.array(ecef_from_lla(self.latitude + delta, self.longitude, alt))
-            p2 = np.array(ecef_from_lla(self.latitude - delta, self.longitude, alt))
-            xnp = p1 - p2
-            m = np.linalg.norm(xnp)
+            down = -np.array([
+                math.cos(lat_r) * math.cos(lon_r),
+                math.cos(lat_r) * math.sin(lon_r),
+                math.sin(lat_r)
+            ])
             
-            if m == 0:
-                log.ODM_WARNING("Cannot compute OPK angles, divider = 0")
-                return
+            east = np.cross(down, north)
+            east /= np.linalg.norm(east)
             
-            # Unit vector pointing north
-            xnp /= m
+            R_ned_to_ecef = np.array([north, east, down]).T
+            
+            # ECEF to ENU transformation
+            R_ecef_to_enu = np.array([
+                [-math.sin(lon_r), math.cos(lon_r), 0],
+                [-math.sin(lat_r)*math.cos(lon_r), -math.sin(lat_r)*math.sin(lon_r), math.cos(lat_r)],
+                [math.cos(lat_r)*math.cos(lon_r), math.cos(lat_r)*math.sin(lon_r), math.sin(lat_r)]
+            ])
+            
+            # Camera to ENU
+            R_cam_to_enu = R_ecef_to_enu @ R_ned_to_ecef @ R_cam_to_ned
+            
+            # Apply camera frame flip:
+            # Photogrammetric convention: X-right, Y-up, Z-backward
+            # OpenSfM convention: X-right, Y-down, Z-forward
+            R_flip = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+            R_cam_to_enu_opensfm = R_cam_to_enu @ R_flip
+            
+            # OpenSfM stores world-to-camera (ENU-to-camera)
+            R_enu_to_cam = R_cam_to_enu_opensfm.T
+            
+            # Extract OPK by inverting rotation_from_opk logic:
+            # rotation_from_opk computes: R = Rc @ Rz(-kappa) @ Ry(-phi) @ Rx(-omega)
+            # where Rc is the same flip matrix
+            # So: Rc.T @ R = Rz(-kappa) @ Ry(-phi) @ Rx(-omega)
+            # This is ZYX intrinsic Euler angles with negated values
+            
+            Rc = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+            R_intermediate = Rc.T @ R_enu_to_cam
+            
+            # Extract ZYX Euler angles
+            # R = Rz(a) @ Ry(b) @ Rx(c) where a=-kappa, b=-phi, c=-omega
+            # Using atan2 formulas for ZYX:
+            #   b = asin(-R[2,0])
+            #   a = atan2(R[1,0], R[0,0])  
+            #   c = atan2(R[2,1], R[2,2])
+            
+            R = R_intermediate
+            neg_phi = math.asin(np.clip(-R[2, 0], -1, 1))
+            neg_kappa = math.atan2(R[1, 0], R[0, 0])
+            neg_omega = math.atan2(R[2, 1], R[2, 2])
+            
+            self.omega = math.degrees(-neg_omega)
+            self.phi = math.degrees(-neg_phi)
+            self.kappa = math.degrees(-neg_kappa)
+            
+            log.ODM_INFO("=== OPK DEBUG: %s ===" % self.filename)
+            log.ODM_INFO("  Input YPR: yaw=%.2f, pitch=%.2f, roll=%.2f" % (self.yaw, self.pitch, self.roll))
+            log.ODM_INFO("  Output OPK: omega=%.2f, phi=%.2f, kappa=%.2f" % (self.omega, self.phi, self.kappa))
 
-            znp = np.array([0, 0, -1]).T
-            ynp = np.cross(znp, xnp)
-
-            cen = np.array([xnp, ynp, znp]).T
-
-            # OPK rotation matrix
-            ceb = cen.dot(cnb).dot(cbb)
-
-            self.omega = math.degrees(math.atan2(-ceb[1][2], ceb[2][2]))
-            self.phi = math.degrees(math.asin(ceb[0][2]))
-            self.kappa = math.degrees(math.atan2(-ceb[0][1], ceb[0][0]))
 
     def get_capture_megapixels(self):
         if self.exif_width is not None and self.exif_height is not None:
@@ -957,3 +1025,14 @@ class ODM_Photo:
     
     def is_make_model(self, make, model):
         return self.camera_make.lower() == make.lower() and self.camera_model.lower() == model.lower()
+    
+    def get_decimal_year(self):
+        dt = datetime.fromtimestamp(self.utc_time / 1000, tz=timezone.utc)
+        year_start = datetime(dt.year, 1, 1, tzinfo=timezone.utc)
+        next_year  = datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc)
+
+        year_fraction = (dt - year_start).total_seconds() / (
+            (next_year - year_start).total_seconds()
+        )
+
+        return dt.year + year_fraction

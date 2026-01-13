@@ -8,6 +8,7 @@ from opendm import log
 
 from stages.dataset import ODMLoadDatasetStage
 from stages.run_opensfm import ODMOpenSfMStage
+from stages.odm_rotation_analysis import ODMRotationAnalysisStage
 from stages.openmvs import ODMOpenMVSStage
 from stages.odm_meshing import ODMeshingStage
 from stages.mvstex import ODMMvsTexStage
@@ -37,6 +38,7 @@ class ODMApp:
         split = ODMSplitStage('split', args, progress=75.0)
         merge = ODMMergeStage('merge', args, progress=100.0)
         opensfm = ODMOpenSfMStage('opensfm', args, progress=25.0)
+        rotation_analysis = ODMRotationAnalysisStage('rotation_analysis', args, progress=26.0)
         openmvs = ODMOpenMVSStage('openmvs', args, progress=50.0)
         filterpoints = ODMFilterPoints('odm_filterpoints', args, progress=52.0)
         meshing = ODMeshingStage('odm_meshing', args, progress=60.0,
@@ -63,10 +65,12 @@ class ODMApp:
                 .connect(opensfm)
 
         if args.fast_orthophoto:
-            opensfm.connect(filterpoints)
+            opensfm.connect(rotation_analysis) \
+                   .connect(filterpoints)  # NEW: rotation_analysis between opensfm and filterpoints
         else:
-            opensfm.connect(openmvs) \
-                   .connect(filterpoints)
+            opensfm.connect(rotation_analysis) \
+                   .connect(openmvs) \
+                   .connect(filterpoints)  # NEW: rotation_analysis between opensfm and openmvs
         
         filterpoints \
             .connect(meshing) \

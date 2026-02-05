@@ -7,6 +7,7 @@ import exifread
 import numpy as np
 from six import string_types
 from datetime import datetime, timedelta, timezone
+from pygeomag import GeoMag
 
 from opendm import log
 from opendm.rollingshutter import get_rolling_shutter_readout
@@ -458,7 +459,7 @@ class ODM_Photo:
                             self.camera_projection = camera_projection
 
                     # OPK
-                    self.set_attr_from_xmp_tag('yaw', xtags, ['@drone-dji:FlightYawDegree', '@Camera:Yaw', 'Camera:Yaw'], float)
+                    self.set_attr_from_xmp_tag('yaw', xtags, ['@drone-dji:GimbalYawDegree','@drone-dji:FlightYawDegree', '@Camera:Yaw', 'Camera:Yaw'], float)
                     self.set_attr_from_xmp_tag('pitch', xtags, ['@drone-dji:GimbalPitchDegree', '@Camera:Pitch', 'Camera:Pitch'], float)
                     self.set_attr_from_xmp_tag('roll', xtags, ['@drone-dji:GimbalRollDegree', '@Camera:Roll', 'Camera:Roll'], float)
 
@@ -892,56 +893,128 @@ class ODM_Photo:
     
     def compute_opk(self):
         if self.has_ypr() and self.has_geo():
+            """
+                Compute OPK angles from DJI gimbal YPR angles.
+                
+                Output OPK is compatible with OpenSfM's rotation_from_opk function.
+                
+                Parameters:
+                    lat: Latitude in degrees
+                    lon: Longitude in degrees  
+                    alt: Altitude in meters
+                    yaw: Gimbal yaw in degrees (heading, 0=North, 90=East)
+                    pitch: Gimbal pitch in degrees (0=nadir, 90=horizon)
+                    roll: Gimbal roll in degrees (typically 0 or 180 for backward-facing)
+                
+                Returns:
+                    omega, phi, kappa: OPK angles in degrees
+            """
+            yr = self.get_decimal_year()
+
+            # Using pygeomag for magnetic declination correction to convert
+            # magnetic heading (from drone compass) to true heading (geographic north)
+            # Required for accurate OPK angle computation from DJI gimbal YPR data  
+            try:
+                # Initialize GeoMag with the image's year to auto-select the correct WMM model
+                # This ensures we use WMM-2020 for 2020-2025 dates, WMM-2025 for 2025-2030, etc.
+                geo_mag = GeoMag(base_year=yr)
+                result = geo_mag.calculate(glat=self.latitude, glon=self.longitude, alt=self.altitude/1000.0, time=yr)
+                declination = result.d  # degrees
+                self.yaw -= declination
+            except (ValueError, OSError) as e:
+                # If the date is outside all available WMM models or there's an error loading coefficients,
+                # skip the magnetic declination correction and log a warning.
+                log.ODM_WARNING("Cannot calculate magnetic declination for %s (date: %.2f): %s. Skipping declination correction." % (self.filename, yr, str(e)))
+
             y, p, r = math.radians(self.yaw), math.radians(self.pitch), math.radians(self.roll)
 
-            # Ref: New Calibration and Computing Method for Direct 
-            # Georeferencing of Image and Scanner Data Using the 
-            # Position and Angular Data of an Hybrid Inertial Navigation System 
+           # YPR rotation matrix
+            # Ref: New Calibration and Computing Method for Direct
+            # Georeferencing of Image and Scanner Data Using the
+            # Position and Angular Data of an Hybrid Inertial Navigation System
             # by Manfred Bäumker
-
-            # YPR rotation matrix
-            cnb = np.array([[ math.cos(y) * math.cos(p), math.cos(y) * math.sin(p) * math.sin(r) - math.sin(y) * math.cos(r), math.cos(y) * math.sin(p) * math.cos(r) + math.sin(y) * math.sin(r)],
-                            [ math.sin(y) * math.cos(p), math.sin(y) * math.sin(p) * math.sin(r) + math.cos(y) * math.cos(r), math.sin(y) * math.sin(p) * math.cos(r) - math.cos(y) * math.sin(r)],
-                            [ -math.sin(p), math.cos(p) * math.sin(r), math.cos(p) * math.cos(r)],
-                           ])
-
+            cnb = np.array([
+                [
+                    np.cos(y) * np.cos(p),
+                    np.cos(y) * np.sin(p) * np.sin(r) - np.sin(y) * np.cos(r),
+                    np.cos(y) * np.sin(p) * np.cos(r) + np.sin(y) * np.sin(r),
+                ],
+                [
+                    np.sin(y) * np.cos(p),
+                    np.sin(y) * np.sin(p) * np.sin(r) + np.cos(y) * np.cos(r),
+                    np.sin(y) * np.sin(p) * np.cos(r) - np.cos(y) * np.sin(r),
+                ],
+                [-np.sin(p), np.cos(p) * np.sin(r), np.cos(p) * np.cos(r)],
+            ])
+            
+            # Flip X and Z for 180 degree roll
+            if math.isclose(abs(r), math.pi, abs_tol=1e-3):
+                cnb[:, 0] *= -1
+                cnb[:, 2] *= -1
+            
             # Convert between image and body coordinates
             # Top of image pixels point to flying direction
             # and camera is looking down.
             # We might need to change this if we want different
             # camera mount orientations (e.g. backward or sideways)
-
             # (Swap X/Y, flip Z)
-            cbb = np.array([[0, 1, 0],
-                            [1, 0, 0],
-                            [0, 0, -1]])
+            cbb = np.array([[0, 1, 0], [1, 0, 0], [0, 0, -1]])
             
-            delta = 1e-7
+            # Compute topocentric north vector
+            # Helper function for topocentric conversion
+            def to_topocentric(ref_lat, ref_lon, ref_alt, lat, lon, alt):
+                """Simple topocentric conversion"""
+                lat1, lon1 = math.radians(ref_lat), math.radians(ref_lon)
+                lat2, lon2 = math.radians(lat), math.radians(lon)
+                
+                # Approximate local ENU transformation
+                dLat = lat2 - lat1
+                dLon = lon2 - lon1
+                dAlt = alt - ref_alt
+                
+                # WGS84 semi-major axis
+                a = 6378137.0
+                
+                x = dLon * a * math.cos(lat1)
+                y = dLat * a
+                z = dAlt
+                
+                return [x, y, z]
             
-            alt = self.altitude if self.altitude is not None else 0.0
-            p1 = np.array(ecef_from_lla(self.latitude + delta, self.longitude, alt))
-            p2 = np.array(ecef_from_lla(self.latitude - delta, self.longitude, alt))
+            delta = 1e-10
+            p1 = np.array(
+                to_topocentric(
+                    self.latitude, self.longitude, self.altitude,
+                    self.latitude + delta, self.longitude, self.altitude
+                )
+            )
+            p2 = np.array(
+                to_topocentric(
+                    self.latitude, self.longitude, self.altitude,
+                    self.latitude - delta, self.longitude, self.altitude
+                )
+            )
+            
             xnp = p1 - p2
             m = np.linalg.norm(xnp)
             
             if m == 0:
-                log.ODM_WARNING("Cannot compute OPK angles, divider = 0")
+                # Cannot compute OPK angles
                 return
             
             # Unit vector pointing north
             xnp /= m
-
+            
             znp = np.array([0, 0, -1]).T
             ynp = np.cross(znp, xnp)
-
             cen = np.array([xnp, ynp, znp]).T
-
+            
             # OPK rotation matrix
             ceb = cen.dot(cnb).dot(cbb)
-
-            self.omega = math.degrees(math.atan2(-ceb[1][2], ceb[2][2]))
-            self.phi = math.degrees(math.asin(ceb[0][2]))
-            self.kappa = math.degrees(math.atan2(-ceb[0][1], ceb[0][0]))
+            
+            self.omega = np.degrees(np.arctan2(-ceb[1][2], ceb[2][2]))
+            self.phi = np.degrees(np.arcsin(ceb[0][2]))
+            self.kappa = np.degrees(np.arctan2(-ceb[0][1], ceb[0][0]))
 
     def get_capture_megapixels(self):
         if self.exif_width is not None and self.exif_height is not None:
@@ -957,3 +1030,14 @@ class ODM_Photo:
     
     def is_make_model(self, make, model):
         return self.camera_make.lower() == make.lower() and self.camera_model.lower() == model.lower()
+
+    def get_decimal_year(self):
+        dt = datetime.fromtimestamp(self.utc_time / 1000, tz=timezone.utc)
+        year_start = datetime(dt.year, 1, 1, tzinfo=timezone.utc)
+        next_year  = datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc)
+
+        year_fraction = (dt - year_start).total_seconds() / (
+            (next_year - year_start).total_seconds()
+        )
+
+        return dt.year + year_fraction
